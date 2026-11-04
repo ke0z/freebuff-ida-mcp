@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freebuff-ida-mcp"
+version = "0.1.0"
+description = "Free, local MCP server for programmatic access to IDA Pro 9.x via the Hex-Rays C++ SDK"
+readme = "README.md"
+license = { text = "Freebuff (proprietary to Freebuff) - IDA Pro SDK is proprietary" }
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "fastmcp>=2.0.0",
+]
+
+[project.scripts]
+freebuff-ida-mcp = "freebuff_ida_mcp.server:main"
+
+[tool.setuptools]
+packages = ["freebuff_ida_mcp"]
+include-package-data = true
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
