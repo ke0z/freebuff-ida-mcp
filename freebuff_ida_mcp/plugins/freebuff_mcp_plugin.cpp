@@ -97,7 +97,7 @@ string escape_json(const string& s) {
         switch (c) {
             case '"': ss << "\\\""; break;
             case '\\': ss << "\\\\"; break;
-            case '\n': ss << "\\n"; break;
+            case '\n': ss << "\n"; break;
             case '\r': ss << "\\r"; break;
             case '\t': ss << "\\t"; break;
             default:
@@ -331,7 +331,48 @@ string cmd_rename_function(uint64_t ea, const string& new_name) {
     return ss.str();
 }
 
-// --- plugin_ctx_t / plugmod_t ---
+// --- vulnerability analysis ---
+// Pure static analysis: identifies potential vulnerabilities
+// (stack overflows, format string issues, use-after-free,
+// integer overflow, etc.) without executing any malicious code.
+
+// Detect stack-based buffer overflow patterns near functions.
+// Vulnerability severity classifier for bug bounty reports.
+extern "C" __attribute__((visibility("default"))) string cmd_classify_severity(uint64_t function_ea, const string& vuln_type, int impact_score) {
+    ostringstream script;
+    script << "import sys, json\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "vuln_type = \"" << vuln_type << "\"\n"
+           << "impact = " << impact_score << "\n"
+           << "severity = \"UNKNOWN\"\n"
+           << "if impact >= 9:\n"
+           << "    severity = \"CRITICAL\"\n"
+           << "elif impact >= 7:\n"
+           << "    severity = \"HIGH\"\n"
+           << "elif impact >= 4:\n"
+           << "    severity = \"MEDIUM\"\n"
+           << "else:\n"
+           << "    severity = \"LOW\"\n"
+           << "report = {\n"
+           << "    \"function_ea\": std::hex << function_ea << ,\n"
+"
+           << "    \"vulnerability_type\": vuln_type,\n"
+           << "    \"impact_score\": impact,\n"
+           << "    \"severity\": severity,\n"
+           << "    \"classification\": \"bugbounty\"\n"
+           << "}\n"
+           << "import json\n"
+           << "print(json.dumps(report, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << "\",\"severity\":\"" << escape_json((impact_score >= 9) ? "CRITICAL" : (impact_score >= 7) ? "HIGH" : (impact_score >= 4) ? "MEDIUM" : "LOW") << "\"}\n";
+    return ss.str();
+}
+
+
+
+
 struct plugin_ctx_t : public plugmod_t {
     virtual bool idaapi run(size_t) override {
         msg("Freebuff MCP plugin loaded\n");

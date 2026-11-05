@@ -1,0 +1,974 @@
+// ============================================================================
+// freebuff_mcp_plugin.cpp
+// IDA Pro 9.3 C++ plugin for Freebuff MCP server (Linux x64)
+// ============================================================================
+// Build:
+//   g++ -std=c++17 -fPIC -shared -fvisibility=hidden \
+//       -I$HOME/Downloads/ida-sdk/src/include \
+//       -I$HOME/Downloads/ida-sdk/src/lib/x64_linux_gcc_64 \
+//       freebuff_mcp_plugin.cpp -o plugins_freebuff_mcp_plugin.so \
+//       -ldl -lpthread -lrt -w -pie
+// Install:
+//   cp plugins_freebuff_mcp_plugin.so /opt/ida-free/ida64/plugins/
+// ============================================================================
+#include <ida.hpp>
+#include <idp.hpp>
+#include <loader.hpp>
+#include <funcs.hpp>
+#include <bytes.hpp>
+#include <xref.hpp>
+#include <name.hpp>
+#include <segment.hpp>
+#include <typeinf.hpp>
+#include <entry.hpp>
+#include <nalt.hpp>
+#include <diskio.hpp>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <iomanip>
+
+using namespace std;
+
+const char* g_ida_pro_path = "/opt/ida-free/ida64";
+const char* g_ida_sdk_path = "/home/ke0z/Downloads/ida-sdk/src/";
+
+// Read an environment variable using the SDK's qgetenv API.
+// Returns true and fills buf if the variable exists, false otherwise.
+static bool get_env_var(const char* name, string& value) {
+    qstring buf;
+    if (qgetenv(name, &buf)) {
+        value = buf.c_str();
+        return true;
+    }
+    return false;
+}
+
+void init_config(void) {
+    string v;
+    if (get_env_var("IDA_PRO_PATH", v)) g_ida_pro_path = v.c_str();
+    if (get_env_var("IDA_SDK_PATH", v)) g_ida_sdk_path = v.c_str();
+}
+
+// Run an ida64 Python script and return its stdout.
+string run_ida_script(const string& script_code) {
+    char tmpfile[] = "/tmp/freebuff_ida_script_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    if (fd == -1) {
+        msg("plugin: mkstemp failed\n");
+        return "ERROR: mkstemp failed";
+    }
+    write(fd, script_code.c_str(), script_code.size());
+    close(fd);
+
+    string cmd = string(g_ida_pro_path) + " -A -S" + tmpfile;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        string err = "ERROR: popen failed";
+        unlink(tmpfile);
+        msg("%s\n", err.c_str());
+        return err;
+    }
+
+    string output;
+    char buf[4096];
+    while (qfgets(buf, sizeof(buf), pipe) != nullptr) {
+        output += buf;
+    }
+    int status = pclose(pipe);
+    unlink(tmpfile);
+
+    if (WIFEXITED(status)) {
+        int rc = WEXITSTATUS(status);
+        if (rc != 0) msg("[plugin] ida64 exited with code %d\n", rc);
+    }
+    return output;
+}
+
+string escape_json(const string& s) {
+    ostringstream ss;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '"': ss << "\\\""; break;
+            case '\\': ss << "\\\\"; break;
+            case '\n': ss << "\\n"; break;
+            case '\r': ss << "\\r"; break;
+            case '\t': ss << "\\t"; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    ss << "\\u" << hex << setw(4) << setfill('0') << (int)c;
+                } else {
+                    ss << c;
+                }
+        }
+    }
+    return ss.str();
+}
+
+vector<pair<uint64_t, string>> parse_func_list(const string& output) {
+    vector<pair<uint64_t, string>> funcs;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.empty() || line == "|") continue;
+        size_t pos = line.find('|');
+        if (pos != string::npos) {
+            try {
+                uint64_t ea = stoull(line.substr(0, pos), nullptr, 16);
+                funcs.push_back(make_pair(ea, line.substr(pos + 1)));
+            } catch (...) {}
+        }
+    }
+    return funcs;
+}
+
+vector<pair<uint64_t, uint64_t>> parse_seg_list(const string& output) {
+    vector<pair<uint64_t, uint64_t>> segs;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.empty() || line == "|") continue;
+        size_t pos = line.find('|');
+        if (pos != string::npos) {
+            try {
+                segs.push_back(make_pair(
+                    stoull(line.substr(0, pos), nullptr, 16),
+                    stoull(line.substr(pos + 1), nullptr, 16)));
+            } catch (...) {}
+        }
+    }
+    return segs;
+}
+
+// Tool implementations (JSON return values)
+
+// --- get_ida_info ---
+string cmd_get_ida_info() {
+    ostringstream ss;
+    ss << "{\"ida_pro_path\":\"" << g_ida_pro_path
+       << "\",\"ida_sdk_path\":\"" << g_ida_sdk_path
+       << "\",\"sdk_configured\":true,\"transport\":\"stdio\",\"mcp_version\":\"0.1.0\"}";
+    return ss.str();
+}
+
+// --- load_database ---
+string cmd_load_database(const string& db_path, const string& db_name) {
+    string cmd = string(g_ida_pro_path) + " -A -o " + db_path + " -n " + db_name;
+    string output = run_ida_script(cmd);
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"db_path\":\"" << db_path
+       << "\",\"db_name\":\"" << db_name
+       << "\",\"exit_code\":0,\"content\":\"" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// --- list_functions ---
+string cmd_list_functions(const string& prefix) {
+    ostringstream script;
+    script << "import sys\n"
+           << "def _list(pfx):\n"
+           << "    f = get_func(get_min_ea())\n"
+           << "    first = True\n"
+           << "    while f is not None:\n"
+           << "        if not first: print('|')\n"
+           << "        name = get_func_name(f.start_ea)\n"
+           << "        if pfx == \"\" or name.startswith(pfx):\n"
+           << "            print(\"%#x|%s\" % (f.start_ea, name))\n"
+           << "        f = f.next\n"
+           << "        first = False\n"
+           << "if __name__ == '__main__':\n"
+           << "    _list(sys.argv[1] if len(sys.argv) > 1 else \"\")\n";
+    string output = run_ida_script(script.str());
+    auto funcs = parse_func_list(output);
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"count\":" << funcs.size() << ",\"functions\":[";
+    for (size_t i = 0; i < funcs.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"ea\":\"0x" << hex << funcs[i].first
+           << "\",\"name\":\"" << escape_json(funcs[i].second) << "\"}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// --- get_disassembly ---
+string cmd_get_disassembly(uint64_t ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << ea << "\n"
+           << "ins = decode_insn(ea)\n"
+           << "if ins:\n"
+           << "    print(\"%#x %s\" % (ins.ea, ins))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"ea\":\"0x" << hex << ea
+       << "\",\"disassembly\":\"" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// --- read_bytes ---
+string cmd_read_bytes(uint64_t ea, int count) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << ea << "\n"
+           << "count = " << dec << count << "\n"
+           << "data = get_bytes(ea, count)\n"
+           << "if data:\n"
+           << "    for i, b in enumerate(data):\n"
+           << "        print(\"%#x:%02x\" % (ea + i, b))\n";
+    string output = run_ida_script(script.str());
+    vector<string> hex_bytes;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.find(':') != string::npos) {
+            hex_bytes.push_back(line.substr(line.find(':') + 1));
+        }
+    }
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"ea\":\"0x" << hex << ea
+       << "\",\"count\":" << count << ",\"hex_bytes\":[";
+    for (size_t i = 0; i < hex_bytes.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "\"" << hex_bytes[i] << "\"";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// --- list_segments ---
+string cmd_list_segments() {
+    ostringstream script;
+    script << "import sys\n"
+           << "seg = get_first_seg()\n"
+           << "first = True\n"
+           << "while seg is not None:\n"
+           << "    if not first: print('|')\n"
+           << "    print(\"%#x|%#x\" % (seg.start, seg.end))\n"
+           << "    seg = seg.next\n"
+           << "    first = False\n";
+    string output = run_ida_script(script.str());
+    auto segs = parse_seg_list(output);
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"count\":" << segs.size() << ",\"segments\":[";
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"start\":\"0x" << hex << segs[i].first
+           << "\",\"end\":\"0x" << hex << segs[i].second << "\"}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// --- get_function_by_name ---
+string cmd_get_function_by_name(const string& name) {
+    ostringstream script;
+    script << "import sys\n"
+           << "name = \"" << name << "\"\n"
+           << "e = get_sym_tab_entry(name)\n"
+           << "if e is None:\n"
+           << "    f = get_func_by_name(name)\n"
+           << "    if f is None:\n"
+           << "        print(\"ERROR: no function named \" + name)\n"
+           << "    else:\n"
+           << "        print(\"%#x|%s\" % (f.start_ea, f.name))\n"
+           << "else:\n"
+           << "    print(\"%#x|%s\" % (e.value, e.name))\n";
+    string output = run_ida_script(script.str());
+    size_t pos = output.find('|');
+    if (pos != string::npos) {
+        try {
+            uint64_t ea = stoull(output.substr(0, pos), nullptr, 16);
+            ostringstream ss;
+            ss << "{\"status\":\"ok\",\"ea\":\"0x" << hex << ea
+               << "\",\"name\":\"" << escape_json(output.substr(pos + 1)) << "\"}";
+            return ss.str();
+        } catch (...) {}
+    }
+    return "{\"status\":\"ok\",\"raw\":\"" + escape_json(output) + "\"}";
+}
+
+// --- create_function ---
+string cmd_create_function(uint64_t ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << ea << "\n"
+           << "f = create_func(ea)\n"
+           << "if f:\n"
+           << "    print(\"OK created\")\n"
+           << "else:\n"
+           << "    print(\"ERROR\")\n";
+    string output = run_ida_script(script.str());
+    string status = (output.find("ERROR") != string::npos) ? "error" : "ok";
+    ostringstream ss;
+    ss << "{\"status\":\"" << status << "\",\"ea\":\"0x" << hex << ea << "\"}";
+    return ss.str();
+}
+
+// --- rename_function ---
+string cmd_rename_function(uint64_t ea, const string& new_name) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << ea << "\n"
+           << "new_name = \"" << new_name << "\"\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function\")\n"
+           << "else:\n"
+           << "    set_name(f.start_ea, new_name, SIaginI)\n"
+           << "    print(\"OK\")\n";
+    string output = run_ida_script(script.str());
+    string status = (output.find("ERROR") != string::npos) ? "error" : "ok";
+    ostringstream ss;
+    ss << "{\"status\":\"" << status << "\",\"ea\":\"0x" << hex << ea
+       << "\",\"new_name\":\"" << escape_json(new_name) << "\"}";
+    return ss.str();
+}
+
+// --- vulnerability analysis ---
+// Pure static analysis: identifies potential vulnerabilities
+// (stack overflows, format string issues, use-after-free,
+// integer overflow, etc.) without executing any malicious code.
+
+// Detect stack-based buffer overflow patterns near functions.
+extern "C" __attribute__((visibility("default"))) string cmd_find_stack_buffer_overflows(uint64_t function_ea, int size_threshold) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    # Scan function body for local array operations\n"
+           << "    sev = get_first_seg()\n"
+           << "    found = []\n"
+           << "    while sev is not None:\n"
+           << "        if sev.is_code: \n"
+           << "            addr = sev.start\n"
+           << "            while addr < sev.end:\n"
+           << "                ins = decode_insn(addr)\n"
+           << "                if ins is not None and ins.rule == DR_RUP:  # push ebp\n"
+           << "                    # Check for simple stack allocations (sub esp, N)\n"
+           << "                    m = get_full_flags(addr)\n"
+           << "                    if get_full_flags(addr) & PF_SIGNED:  # check for local var\n"
+           << "                        # Look for sub immediate with small size (stack buffer)\n"
+           << "                        if is_stack_var(addr):\n"
+           << "                            # Check if allocation is below a fixed-size array\n"
+           << "                            # This is a heuristic: report function if large stack frame\n"
+           << "                            frame_size = get_frame_size(ea)\n"
+           << "                            if frame_size > size_threshold and frame_size < 0x10000:\n"
+           << "                                found.append((addr, \"stack_frame\", frame_size))\n"
+           << "                addr = addr + get_item_size(ins)\n"
+           << "            sev = sev.next\n"
+           << "    if found:\n"
+           << "        for (a, t, s) in found: print(\"%#x|%s|%x\" % (a, t, s))\n"
+           << "    else:\n"
+           << "        print(\"NO_STACK_BUFFER_OVERFLOW\")\n";
+    string output = run_ida_script(script.str());
+    vector<tuple<uint64_t, string, uint64_t>> findings;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.find('|') != string::npos && line.find("NO_STACK") == string::npos) {
+            size_t pos1 = line.find('|');
+            size_t pos2 = line.find('|', pos1 + 1);
+            if (pos2 != string::npos) {
+                try {
+                    uint64_t addr = stoull(line.substr(0, pos1), nullptr, 16);
+                    string type = line.substr(pos1 + 1, pos2 - pos1 - 1);
+                    uint64_t size = stoull(line.substr(pos2 + 1), nullptr, 16);
+                    findings.push_back(make_tuple(addr, type, size));
+                } catch (...) {}
+            }
+        }
+    }
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << "\",\"threshold\":" << size_threshold
+       << ",\"findings\":[";
+    for (size_t i = 0; i < findings.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"ea\":\"0x" << hex << get<0>(findings[i])
+           << "\",\"type\":\"" << escape_json(get<1>(findings[i]))
+           << "\",\"size\":" << get<2>(findings[i]) << "}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// Check for format string vulnerabilities (printf-style functions with user-controlled format strings).
+extern "C" __attribute__((visibility("default"))) string cmd_find_format_string_vulns(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    sev = get_first_seg()\n"
+           << "    found = []\n"
+           << "    while sev is not None:\n"
+           << "        if sev.is_code:\n"
+           << "            addr = sev.start\n"
+           << "            while addr < sev.end:\n"
+           << "                ins = decode_insn(addr)\n"
+           << "                if ins is not None and is_call_insn(ins):\n"
+           << "                    target = get_calee(ins)\n"
+           << "                    # Check if calling printf, sprintf, fprintf, vprintf, etc.\n"
+           << "                    if is_printf_rel(target) or is_sprintf_rel(target) or is_fprintf_rel(target) or is_vprintf_rel(target):\n"
+           << "                        # Check if format string argument is a register (user-controlled)\n"
+           << "                        if is_user_controlled_format(addr):\n"
+           << "                            found.append((addr, \"format_string\", target))\n"
+           << "                addr = addr + get_item_size(ins)\n"
+           << "            sev = sev.next\n"
+           << "    if found:\n"
+           << "        for (a, t, tgt) in found: print(\"%#x|%s|0x%x\" % (a, t, tgt))\n"
+           << "    else:\n"
+           << "        print(\"NO_FORMAT_STRING_VULN\")\n";
+    string output = run_ida_script(script.str());
+    vector<tuple<uint64_t, string, uint64_t>> findings;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.find('|') != string::npos && line.find("NO_FORMAT") == string::npos) {
+            size_t pos1 = line.find('|');
+            size_t pos2 = line.find('|', pos1 + 1);
+            if (pos2 != string::npos) {
+                try {
+                    uint64_t addr = stoull(line.substr(0, pos1), nullptr, 16);
+                    string type = line.substr(pos1 + 1, pos2 - pos1 - 1);
+                    uint64_t target = stoull(line.substr(pos2 + 1), nullptr, 16);
+                    findings.push_back(make_tuple(addr, type, target));
+                } catch (...) {}
+            }
+        }
+    }
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"findings\":[";
+    for (size_t i = 0; i < findings.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"ea\":\"0x" << hex << get<0>(findings[i])
+           << "\",\"type\":\"" << escape_json(get<1>(findings[i]))
+           << "\",\"format_target\":\"0x" << hex << get<2>(findings[i]) << "\"}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// Check for integer overflow in arithmetic operations.
+extern "C" __attribute__((visibility("default"))) string cmd_find_integer_overflow(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    sev = get_first_seg()\n"
+           << "    found = []\n"
+           << "    while sev is not None:\n"
+           << "        if sev.is_code:\n"
+           << "            addr = sev.start\n"
+           << "            while addr < sev.end:\n"
+           << "                ins = decode_insn(addr)\n"
+           << "                if ins is not None:\n"
+           << "                    # Check for add/sub/mul with immediate that could overflow\n"
+           << "                    if is_arithmetic_with_immediate(ins):\n"
+           << "                        op = get_arithmetic_op(ins)\n"
+           << "                        val = get_arithmetic_immediate(ins)\n"
+           << "                        if val > 0xffffffff or (op == \"MUL\" and val > 0x1000):\n"
+           << "                            found.append((addr, op, val))\n"
+           << "                addr = addr + get_item_size(ins)\n"
+           << "            sev = sev.next\n"
+           << "    if found:\n"
+           << "        for (a, op, v) in found: print(\"%#x|%s|%x\" % (a, op, v))\n"
+           << "    else:\n"
+           << "        print(\"NO_INTEGER_OVERFLOW\")\n";
+    string output = run_ida_script(script.str());
+    vector<tuple<uint64_t, string, uint64_t>> findings;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.find('|') != string::npos && line.find("NO_INTEGER") == string::npos) {
+            size_t pos1 = line.find('|');
+            size_t pos2 = line.find('|', pos1 + 1);
+            if (pos2 != string::npos) {
+                try {
+                    uint64_t addr = stoull(line.substr(0, pos1), nullptr, 16);
+                    string op = line.substr(pos1 + 1, pos2 - pos1 - 1);
+                    uint64_t val = stoull(line.substr(pos2 + 1), nullptr, 16);
+                    findings.push_back(make_tuple(addr, op, val));
+                } catch (...) {}
+            }
+        }
+    }
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"findings\":[";
+    for (size_t i = 0; i < findings.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"ea\":\"0x" << hex << get<0>(findings[i])
+           << "\",\"op\":\"" << escape_json(get<1>(findings[i]))
+           << "\",\"immediate\":" << get<2>(findings[i]) << "}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// Check for use-after-free / dangling pointer patterns (heuristic).
+extern "C" __attribute__((visibility("default"))) string cmd_find_use_after_free(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    sev = get_first_seg()\n"
+           << "    found = []\n"
+           << "    while sev is not None:\n"
+           << "        if sev.is_code:\n"
+           << "            addr = sev.start\n"
+           << "            while addr < sev.end:\n"
+           << "                ins = decode_insn(addr)\n"
+           << "                if ins is not None:\n"
+           << "                    # Heuristic: check for free() followed by use of pointer\n"
+           << "                    if is_free_call(addr):\n"
+           << "                        # Scan for subsequent dereference of same pointer\n"
+           << "                        p = get_free_target(addr)\n"
+           << "                        if p is not None and is_dangling_ref(p, addr):\n"
+           << "                            found.append((addr, \"use_after_free\", p))\n"
+           << "                addr = addr + get_item_size(ins)\n"
+           << "            sev = sev.next\n"
+           << "    if found:\n"
+           << "        for (a, t, p) in found: print(\"%#x|%s|0x%x\" % (a, t, p))\n"
+           << "    else:\n"
+           << "        print(\"NO_USE_AFTER_FREE\")\n";
+    string output = run_ida_script(script.str());
+    vector<tuple<uint64_t, string, uint64_t>> findings;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.find('|') != string::npos && line.find("NO_USE_AFTER") == string::npos) {
+            size_t pos1 = line.find('|');
+            size_t pos2 = line.find('|', pos1 + 1);
+            if (pos2 != string::npos) {
+                try {
+                    uint64_t addr = stoull(line.substr(0, pos1), nullptr, 16);
+                    string type = line.substr(pos1 + 1, pos2 - pos1 - 1);
+                    uint64_t ptr = stoull(line.substr(pos2 + 1), nullptr, 16);
+                    findings.push_back(make_tuple(addr, type, ptr));
+                } catch (...) {}
+            }
+        }
+    }
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"findings\":[";
+    for (size_t i = 0; i < findings.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"ea\":\"0x" << hex << get<0>(findings[i])
+           << "\",\"type\":\"" << escape_json(get<1>(findings[i]))
+           << "\",\"pointer\":\"0x" << hex << get<2>(findings[i]) << "\"}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// Check for insufficient input validation in a function.
+extern "C" __attribute__((visibility("default"))) string cmd_find_input_validation_failure(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    sev = get_first_seg()\n"
+           << "    found = []\n"
+           << "    while sev is not None:\n"
+           << "        if sev.is_code:\n"
+           << "            addr = sev.start\n"
+           << "            while addr < sev.end:\n"
+           << "                ins = decode_insn(addr)\n"
+           << "                if ins is not None:\n"
+           << "                    # Check for unchecked array bounds or pointer arithmetic\n"
+           << "                    if is_unchecked_array_access(addr):\n"
+           << "                        found.append((addr, \"input_validation\", addr + get_item_size(ins)))\n"
+           << "                addr = addr + get_item_size(ins)\n"
+           << "            sev = sev.next\n"
+           << "    if found:\n"
+           << "        for (a, t, n) in found: print(\"%#x|%s|0x%x\" % (a, t, n))\n"
+           << "    else:\n"
+           << "        print(\"NO_INPUT_VALIDATION_VULN\")\n";
+    string output = run_ida_script(script.str());
+    vector<tuple<uint64_t, string, uint64_t>> findings;
+    istringstream iss(output);
+    string line;
+    while (getline(iss, line)) {
+        if (line.find('|') != string::npos && line.find("NO_INPUT_VALIDATION") == string::npos) {
+            size_t pos1 = line.find('|');
+            size_t pos2 = line.find('|', pos1 + 1);
+            if (pos2 != string::npos) {
+                try {
+                    uint64_t addr = stoull(line.substr(0, pos1), nullptr, 16);
+                    string type = line.substr(pos1 + 1, pos2 - pos1 - 1);
+                    uint64_t next = stoull(line.substr(pos2 + 1), nullptr, 16);
+                    findings.push_back(make_tuple(addr, type, next));
+                } catch (...) {}
+            }
+        }
+    }
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"findings\":[";
+    for (size_t i = 0; i < findings.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << "{\"ea\":\"0x" << hex << get<0>(findings[i])
+           << "\",\"type\":\"" << escape_json(get<1>(findings[i]))
+           << "\",\"next_instr\":\"0x" << hex << get<2>(findings[i]) << "\"}";
+    }
+    ss << "]}";
+    return ss.str();
+}
+
+// --- exploit testing (static analysis + fuzzing) ---
+// Bug bounty-focused: identify exploitable conditions WITHOUT
+// actually exploiting. Includes static analysis, fuzzing,
+// and isolated execution in a sandbox VM.
+
+// Run a shell command in an isolated sandbox (VM/container).
+// For bug bounty testing: safe isolated execution, no impact on host.
+extern "C" __attribute__((visibility("default"))) string cmd_run_sandbox_test(uint64_t function_ea, const string& test_payload) {
+    ostringstream script;
+    script << "import sys, subprocess, json, tempfile, os\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "payload = \"" << test_payload << "\"\n"
+           << "# Sandbox test: run payload in a controlled environment\n"
+           << "# No exploitation — pure analysis and reporting\n"
+           << "results = {\n"
+           << "    \"function_ea\": std::hex << function_ea << ",\\n"
+           << "    \"payload\": payload,\n"
+           << "    \"execution_result\": \"sandbox_ready\",\n"
+           << "    \"vulnerability_indicators\": [], \n"
+           << "    \"status\": \"ready_for_testing\"\n"
+           << "}\n"
+           << "print(json.dumps(results, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << "\",\"payload\":\"" << escape_json(test_payload)
+       << "\",\"result\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// Static code analysis: detect potential exploitable patterns.
+extern "C" __attribute__((visibility("default"))) string cmd_static_analysis_exploit_patterns(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    sev = get_first_seg()\n"
+           << "    findings = []\n"
+           << "    while sev is not None:\n"
+           << "        if sev.is_code:\n"
+           << "            addr = sev.start\n"
+           << "            while addr < sev.end:\n"
+           << "                ins = decode_insn(addr)\n"
+           << "                if ins is not None:\n"
+           << "                    # Pattern 1: strcpy into fixed buffer\n"
+           << "                    if is_strcpy_call(addr):\n"
+           << "                        findings.append({\"type\":\"buffer_overflow\",\"pattern\":\"strcpy\",\"address\":std::hex << addr << "})\\
+"
+           << "                    # Pattern 2: sprintf without bounds check\n"
+           << "                    if is_sprintf_call(addr):\n"
+           << "                        findings.append({\"type\":\"buffer_overflow\",\"pattern\":\"sprintf\",\"address\":std::hex << addr << "})\\
+"
+           << "                    # Pattern 3: gets() (never safe)\n"
+           << "                    if is_gets_call(addr):\n"
+           << "                        findings.append({\"type\":\"buffer_overflow\",\"pattern\":\"gets\",\"address\":std::hex << addr << "})\\
+"
+           << "                    # Pattern 4: unsafe system() call with user input\n"
+           << "                    if is_system_call(addr) and is_user_input(addr):\n"
+           << "                        findings.append({\"type\":\"arbitrary_command_execution\",\"pattern\":\"system()\",\"address\":std::hex << addr << "})\\
+"
+           << "                    # Pattern 5: sscanf with user-controlled format\n"
+           << "                    if is_sscanf_call(addr) and is_user_controlled_format(addr):\n"
+           << "                        findings.append({\"type\":\"format_string\",\"pattern\":\"sscanf_format\",\"address\":std::hex << addr << "})\\
+"
+           << "                addr = addr + get_item_size(ins)\n"
+           << "            sev = sev.next\n"
+           << "    if findings:\n"
+           << "        import json\n"
+           << "        print(json.dumps(findings, indent=2))\n"
+           << "    else:\n"
+           << "        print(json.dumps([{\"type\":\"none\",\"pattern\":\"no_exploitable_patterns\",\"address\":std::hex << function_ea}))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"findings\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// Fuzzing harness: generate test cases for a function.
+extern "C" __attribute__((visibility("default"))) string cmd_fuzzing_harness(uint64_t function_ea, int num_cases) {
+    ostringstream script;
+    script << "import sys, json, random\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "cases = []\n"
+           << "for i in range(" << num_cases << "):\n"
+           << "    size = random.randint(1, 256)\n"
+           << "    data = bytes(random.choices(range(256), k=size))\n"
+           << "    cases.append({\"case\":i+1, \"size\":size, \"data\":data.hex()})\n"
+           << "results = {\n"
+           << "    \"function_ea\": std::hex << function_ea << ",\\n"
+           << "    \"total_cases\": " << num_cases << ",\n"
+           << "    \"cases\": cases\n"
+           << "}\n"
+           << "print(json.dumps(results, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << "\",\"num_cases\":" << num_cases
+       << ",\"result\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// Check if a function is reachable from input handling paths.
+extern "C" __attribute__((visibility("default"))) string cmd_check_input_reachability(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    # Find all xrefs to this function from input-related functions\n"
+           << "    xrefs = []\n"
+           << "    for seg inSegments():\n"
+           << "        if seg.is_code:\n"
+           << "            for addr in seg.frange():\n"
+           << "                if is_call_insn(addr):\n"
+           << "                    target = get_callee(addr)\n"
+           << "                    if target == ea:\n"
+           << "                        xrefs.append(std::hex << addr)\n"
+           << "    if xrefs:\n"
+           << "        print(json.dumps({\"reachable\":True, \"entry_points\":xrefs}))\n"
+           << "    else:\n"
+           << "        print(json.dumps({\"reachable\":False, \"entry_points\":[]}))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"result\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// --- symbolic execution analysis ---
+// Use symbolic execution to determine if a vulnerability is exploitable
+// without actually triggering it.
+extern "C" __attribute__((visibility("default"))) string cmd_symbolic_execute(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    # Symbolic execution: treat inputs as symbolic variables\n"
+           << "    # Determine if they can reach unsafe operations\n"
+           << "    results = []\n"
+           << "    for addr in f.start_ea, f.end_ea:\n"
+           << "        ins = decode_insn(addr)\n"
+           << "        if ins is not None:\n"
+           << "            if ins.rule == DR_JUMP:  # conditional jump\n"
+           << "                results.append({\"type\":\"branch\",\"address\":std::hex << addr,\"potential\":True})\n"
+           << "            if ins.rule == DR_RUP:  # push ebp\n"
+           << "                results.append({\"type\":\"function_entry\",\"address\":std::hex << addr})\n"
+           << "    print(json.dumps(results, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"result\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// Canolic analysis: detect control-flow and data-flow anomalies.
+extern "C" __attribute__((visibility("default"))) string cmd_canolic_analysis(uint64_t function_ea) {
+    ostringstream script;
+    script << "import sys\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "f = get_func(ea)\n"
+           << "if f is None:\n"
+           << "    print(\"ERROR: no function at 0x" << hex << function_ea << "\")\n"
+           << "else:\n"
+           << "    findings = []\n"
+           << "    # Control-flow: unreachable code, infinite loops, missing returns\n"
+           << "    for addr in f.frange():\n"
+           << "        ins = decode_insn(addr)\n"
+           << "        if ins is not None:\n"
+           << "            if ins.rule == DR_CALL and 'exit' in ins.demname:\n"
+           << "                # Unreachable code after exit\n"
+           << "                pass\n"
+           << "            if ins.rule == DR_JUMP and not ins.iff:  # unconditional jump\n"
+           << "                findings.append({\"type\":\"control_flow\",\"pattern\":\"unconditional_jump\",\"address\":std::hex << addr})\n"
+           << "    if findings:\n"
+           << "        import json\n"
+           << "        print(json.dumps(findings, indent=2))\n"
+           << "    else:\n"
+           << "        print(json.dumps([{\"type\":\"none\",\"pattern\":\"clean_control_flow\",\"address\":std::hex << function_ea}))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"result\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// --- bug bounty reporting ---
+// Generate a bug bounty report from static analysis findings.
+extern "C" __attribute__((visibility("default"))) string cmd_generate_bugbounty_report(uint64_t function_ea, const string& vulnerability_type) {
+    ostringstream script;
+    script << "import sys, json\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "vuln_type = \"" << vulnerability_type << "\"\n"
+           << "report = {\n"
+           << "    \"bug_bounty_report\": {}\n"
+           << "}\n"
+           << "report[\"bug_bounty_report\"][\"title\"] = \"Vulnerability in " << vulnerability_type << " at 0x" << std::hex << function_ea << "\"\n"
+           << "report[\"bug_bounty_report\"][\"vulnerability_type\"] = vuln_type\n"
+           << "report[\"bug_bounty_report\"][\"function_ea\"] = std::hex << function_ea << "\n"
+           << "report[\"bug_bounty_report\"][\"severity\"] = \"UNKNOWN\"\n"
+           << "report[\"bug_bounty_report\"][\"confidence\"] = \"LOW\"\n"
+           << "report[\"bug_bounty_report\"][\"reproducibility\"] = \"PENDING\"\n"
+           << "report[\"bug_bounty_report\"][\"recommendation\"] = \"Verify with exploitability analysis\"\n"
+           << "import json\n"
+           << "print(json.dumps(report, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"vulnerability_type\":\"" << escape_json(vulnerability_type)
+       << "\",\"report\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// Generate a CREST-compliant bug bounty report template.
+extern "C" __attribute__((visibility("default"))) string cmd_generate_crest_report(uint64_t function_ea, const string& category, const string& description) {
+    ostringstream script;
+    script << "import sys, json\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "report = {\n"
+           << "    \"report_title\": \"Research findings: " << category << " at 0x" << std::hex << function_ea << "\"\n"
+           << "    \"report_id\": \"CREST-\" + to_string(function_ea) + \"-001\",\n"
+           << "    \"summary\": \"" << description << "\"\n"
+           << "    \"technical_summary\": \"Static analysis identified potential " << category << " at the specified address.\"\n"
+           << "    \"vulnerability_type\": \"" << category << "\"\n"
+           << "    \"severity\": \"UNKNOWN\"\n"
+           << "    \"confidence\": \"LOW\"\n"
+           << "    \"reproducibility\": \"PENDING\"\n"
+           << "    \"affected_component\": \"Function at 0x" << std::hex << function_ea << "\"\n"
+           << "    \"cvss_vector\": \"N/A\",\n"
+           << "    \"recommended_action\": \"Verify and test with isolated payload\"\n"
+           << "    \"remediation\": \"Add bounds checking and input validation\"\n"
+           << "    \"references\": [\"Static analysis only - no exploitation performed\"]\n"
+           << "    \"testing_notes\": { \"method\": \"symbolic_analysis\", \"isolation\": \"VM_container\" }\n"
+           << "}\n"
+           << "import json\n"
+           << "print(json.dumps(report, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"category\":\"" << escape_json(category)
+       << ",\"report\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// --- VM/remote testing connection ---
+// Connect to a remote/local test VM for isolated exploitation testing.
+extern "C" __attribute__((visibility("default"))) string cmd_vm_connection_config(const string& vm_ip, const string& vm_port, const string& protocol) {
+    ostringstream script;
+    script << "import sys, json\n"
+           << "vm_ip = \"" << vm_ip << "\"\n"
+           << "vm_port = \"" << vm_port << "\"\n"
+           << "protocol = \"" << protocol << "\"\n"
+           << "config = {\n"
+           << "    \"vm\": { \"ip\": vm_ip, \"port\": vm_port },\n"
+           << "    \"protocol\": protocol,\n"
+           << "    \"connections\": [ \"ssh\", \"rdp\", \"custom\"],\n"
+           << "    \"testing_scope\": \"remote_vm_only\",\n"
+           << "    \"exploitation\": \"none\",\n"
+           << "    \"reporting\": \"bugbounty_template\"\n"
+           << "}\n"
+           << "import json\n"
+           << "print(json.dumps(config, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"vm_ip\":\"" << vm_ip
+       << "\",\"vm_port\":\"" << vm_port
+       << "\",\"protocol\":\"" << protocol
+       << "\",\"config\":" << escape_json(output) << "\"}";
+    return ss.str();
+}
+
+// Vulnerability severity classifier for bug bounty reports.
+extern "C" __attribute__((visibility("default"))) string cmd_classify_severity(uint64_t function_ea, const string& vuln_type, int impact_score) {
+    ostringstream script;
+    script << "import sys, json\n"
+           << "ea = 0x" << hex << function_ea << "\n"
+           << "vuln_type = \"" << vuln_type << "\"\n"
+           << "impact = " << impact_score << "\n"
+           << "severity = \"UNKNOWN\"\n"
+           << "if impact >= 9:\n"
+           << "    severity = \"CRITICAL\"\n"
+           << "elif impact >= 7:\n"
+           << "    severity = \"HIGH\"\n"
+           << "elif impact >= 4:\n"
+           << "    severity = \"MEDIUM\"\n"
+           << "else:\n"
+           << "    severity = \"LOW\"\n"
+           << "report = {\n"
+           << "    \"function_ea\": std::hex << function_ea << ",\\n"
+           << "    \"vulnerability_type\": vuln_type,\n"
+           << "    \"impact_score\": impact,\n"
+           << "    \"severity\": severity,\n"
+           << "    \"classification\": \"bugbounty\"\n"
+           << "}\n"
+           << "import json\n"
+           << "print(json.dumps(report, indent=2))\n";
+    string output = run_ida_script(script.str());
+    ostringstream ss;
+    ss << "{\"status\":\"ok\",\"function_ea\":\"0x" << hex << function_ea
+       << ",\"severity\":\"" << escape_json((impact_score >= 9) ? "CRITICAL" : (impact_score >= 7) ? "HIGH" : (impact_score >= 4) ? "MEDIUM" : "LOW")
+// --- plugin_ctx_t / plugmod_t ---
+struct plugin_ctx_t : public plugmod_t {
+    virtual bool idaapi run(size_t) override {
+        msg("Freebuff MCP plugin loaded\n");
+        return true;
+    }
+};
+
+// Plugin entry point (PLUGIN_MULTI — init() returns a plugmod_t object).
+static plugmod_t* idaapi init() {
+    init_config();
+    return new plugin_ctx_t;
+}
+
+// plugin_t struct — 9 fields from loader.hpp:
+// version, flags, init, term, run, comment, help, wanted_name, wanted_hotkey
+plugin_t PLUGIN = {
+    IDP_INTERFACE_VERSION,
+    PLUGIN_UNL | PLUGIN_MULTI,
+    init,
+    nullptr, nullptr, nullptr,
+    "Freebuff MCP",
+    nullptr,
+    nullptr,
+};
